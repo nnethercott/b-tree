@@ -20,6 +20,8 @@ const Header = struct {
     // each cell stores a pointer to the page where keys are lte than it.
     // here we take the sqlite approach and keep the next ptr in the header
     right_ptr: ?*SlottedPage = null,
+
+    // freeblocks: []usize
 };
 
 fn cell(k: type, v: type) type {
@@ -109,6 +111,8 @@ const SlottedPage = struct {
 };
 
 fn binary_search_value(page: *const SlottedPage, needle: i32) ?i32 {
+    expect(page.header.kind == .Leaf) catch unreachable;
+
     const idx = std.sort.binarySearch(
         Offset,
         page.offsets.items[0..],
@@ -117,7 +121,7 @@ fn binary_search_value(page: *const SlottedPage, needle: i32) ?i32 {
     ) orelse return null;
 
     const offset = page.offsets.items[idx];
-    return page.cells.items[offset.offset].value;
+    return page.cells.items[offset.offset].value.?;
 }
 
 fn binary_search_page(page: *const SlottedPage, needle: i32) *SlottedPage {
