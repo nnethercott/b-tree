@@ -1,4 +1,5 @@
 const std = @import("std");
+const expect = std.testing.expect;
 
 pub fn main() !void {
     const nums = [_]u8{ 1, 2, 3 };
@@ -10,5 +11,5 @@ pub fn main() !void {
     };
 
     const idx = std.sort.upperBound(u8, &nums, 4, S.cmp);
-    std.debug.print("{d}", .{idx});
+    try expect(idx == 3);
 }

@@ -7,7 +7,7 @@ pub fn main(init: std.process.Init) !void {
 
     var page: SlottedPage = .empty;
     try page.insert(arena.allocator(), 42, 1);
-    std.debug.print("{any}\n", .{page.get(42)});
+    std.debug.print("{any}\n", .{page.get(0)});
 }
 
 const CellKind = enum {
@@ -26,8 +26,11 @@ fn cell(k: type, v: type) type {
     return struct {
         key_size: usize = @sizeOf(k),
         key: k,
+
+        /// case: `CellKind.Leaf`
         value: ?v = null,
 
+        /// case: `CellKind.Internal`
         /// each separator key has a child pointer, while the last pointer is
         /// stored separately, since it’s not paired with any key
         next_page: ?*SlottedPage = null,
@@ -36,20 +39,28 @@ fn cell(k: type, v: type) type {
     };
 }
 
-// TODO: 
-// - replace offset with a pointer
-// - refactor cmp functions to use self.ptr.*.key in the comparisons
+// FIXME: everything needs to be generic later
+const i32Cell = cell(i32, i32);
+const FindNeedleCtx = struct {
+    needle: i32,
+    cells: []i32Cell,
+
+    const Self = @This();
+
+    fn init(needle: i32, cells: []i32Cell) Self {
+        return .{ .needle = needle, .cells = cells };
+    }
+};
+
 const Offset = struct {
-    k: i32,
     offset: usize,
 
-    fn lessThanFn(context: void, lhs: Offset, rhs: Offset) bool {
-        _ = context;
-        return lhs.k < rhs.k;
+    fn lessThanFn(ctx: FindNeedleCtx, lhs: Offset, rhs: Offset) bool {
+        return ctx.cells[lhs.offset].key < ctx.cells[rhs.offset].key;
     }
 
-    fn cmpKey(key: i32, off: Offset) std.math.Order {
-        return std.math.order(key, off.k);
+    fn cmpKey(ctx: FindNeedleCtx, off: Offset) std.math.Order {
+        return std.math.order(ctx.needle, ctx.cells[off.offset].key);
     }
 };
 
@@ -59,13 +70,15 @@ const SlottedPage = struct {
     cells: std.ArrayList(cell(i32, i32)) = .empty,
     offset: usize = 0,
 
+    // fanout: usize
+
     const Self = @This();
     const empty: Self = .{ .header = .{} };
 
     fn insert(self: *Self, gpa: std.mem.Allocator, k: i32, v: i32) !void {
         // TODO: check if we're at capacity and SPLIT !
-        try self.offsets.append(gpa, .{ .k = k, .offset = self.offset });
-        try self.cells.append(gpa, .{ .key = k, .value = v });
+        try self.offsets.append(gpa, .{ .offset = self.offset });
+        try self.cells.insert(gpa, 0, .{ .key = k, .value = v });
 
         // FIXME: what if we always allocated here ? std.heap.FixedBufferAllocator.init(buffer: []u8)
         // and then kept this allocator local to the slotted page ?
@@ -73,7 +86,12 @@ const SlottedPage = struct {
         // BUT: could use a fba on the corresponding slice to alloc...
 
         // now reorder the self.offsets
-        std.sort.heap(Offset, self.offsets.items[0..], {}, Offset.lessThanFn);
+        std.sort.heap(
+            Offset,
+            self.offsets.items[0..],
+            FindNeedleCtx.init(k, self.cells.items[0..]),
+            Offset.lessThanFn,
+        );
         self.offset += 1;
     }
 
@@ -91,7 +109,13 @@ const SlottedPage = struct {
 };
 
 fn binary_search_value(page: *const SlottedPage, needle: i32) ?i32 {
-    const idx = std.sort.binarySearch(Offset, page.offsets.items[0..], needle, Offset.cmpKey) orelse return null;
+    const idx = std.sort.binarySearch(
+        Offset,
+        page.offsets.items[0..],
+        FindNeedleCtx.init(needle, page.cells.items[0..]),
+        Offset.cmpKey,
+    ) orelse return null;
+
     const offset = page.offsets.items[idx];
     return page.cells.items[offset.offset].value;
 }
@@ -99,13 +123,18 @@ fn binary_search_value(page: *const SlottedPage, needle: i32) ?i32 {
 fn binary_search_page(page: *const SlottedPage, needle: i32) *SlottedPage {
     expect(page.header.kind == .Internal) catch unreachable;
 
-    const offset_idx = std.sort.upperBound(Offset, page.offsets.items[0..], needle, Offset.cmpKey);
+    const offset_idx = std.sort.upperBound(
+        Offset,
+        page.offsets.items[0..],
+        FindNeedleCtx.init(needle, page.cells.items[0..]),
+        Offset.cmpKey,
+    );
 
     if (offset_idx < page.cells.items.len) {
         const idx = page.offsets.items[offset_idx].offset;
         return page.cells.items[idx].next_page.?;
     }
 
-    // item is on the right
+    // otherwise item is on the right
     return page.header.right_ptr.?;
 }
