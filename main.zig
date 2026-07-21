@@ -7,7 +7,9 @@ pub fn main(init: std.process.Init) !void {
 
     var page: SlottedPage = .empty;
     try page.insert(arena.allocator(), 42, 1);
+
     std.debug.print("{any}\n", .{page.get(0)});
+    std.debug.print("{any}\n", .{page.get(42)});
 }
 
 const CellKind = enum {
@@ -43,26 +45,16 @@ fn cell(k: type, v: type) type {
 
 // FIXME: everything needs to be generic later
 const i32Cell = cell(i32, i32);
-const FindNeedleCtx = struct {
-    needle: i32,
-    cells: []i32Cell,
-
-    const Self = @This();
-
-    fn init(needle: i32, cells: []i32Cell) Self {
-        return .{ .needle = needle, .cells = cells };
-    }
-};
 
 const Offset = struct {
     offset: usize,
 
-    fn lessThanFn(ctx: FindNeedleCtx, lhs: Offset, rhs: Offset) bool {
-        return ctx.cells[lhs.offset].key < ctx.cells[rhs.offset].key;
+    fn lessThanFn(ctx: struct { i32, []i32Cell }, lhs: Offset, rhs: Offset) bool {
+        return ctx[1][lhs.offset].key < ctx[1][rhs.offset].key;
     }
 
-    fn cmpKey(ctx: FindNeedleCtx, off: Offset) std.math.Order {
-        return std.math.order(ctx.needle, ctx.cells[off.offset].key);
+    fn cmpKey(ctx: struct { i32, []i32Cell }, off: Offset) std.math.Order {
+        return std.math.order(ctx[0], ctx[1][off.offset].key);
     }
 };
 
@@ -91,7 +83,7 @@ const SlottedPage = struct {
         std.sort.heap(
             Offset,
             self.offsets.items[0..],
-            FindNeedleCtx.init(k, self.cells.items[0..]),
+            .{ k, self.cells.items[0..] },
             Offset.lessThanFn,
         );
         self.offset += 1;
@@ -116,7 +108,7 @@ fn binary_search_value(page: *const SlottedPage, needle: i32) ?i32 {
     const idx = std.sort.binarySearch(
         Offset,
         page.offsets.items[0..],
-        FindNeedleCtx.init(needle, page.cells.items[0..]),
+        .{ needle, page.cells.items[0..] },
         Offset.cmpKey,
     ) orelse return null;
 
@@ -130,7 +122,7 @@ fn binary_search_page(page: *const SlottedPage, needle: i32) *SlottedPage {
     const offset_idx = std.sort.upperBound(
         Offset,
         page.offsets.items[0..],
-        FindNeedleCtx.init(needle, page.cells.items[0..]),
+        .{ needle, page.cells.items[0..] },
         Offset.cmpKey,
     );
 
