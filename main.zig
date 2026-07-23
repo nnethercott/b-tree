@@ -1,15 +1,35 @@
 const std = @import("std");
 const expect = std.testing.expect;
 
+// NOTE: few things i don't like
+// - @constCast due to find_leaf_page
+// - everything in one tightly coupled generic fn
+
+// TODO:
+// freelist impl;
+// - store available idx cells in a header field
+// - make offset id for inserted the freelist.first
+// - only search over non-deleted cells
+//
+// splitting
+// - we can use the breadcrumbs to KNOW if a parent exists !
+// - at each depth, perform a split and update the parent with the new pages
+// - should it belong to the Traversal ? or another fn(self: *Self, t: *Traversal)?
+
+// questions:
+// - [fanout]Cell is presumably allocated on the stack; how then do we get page alignment and why does that matter?
+// - ^for me its related to mmapping some data structure ? so that the corresponding pages bring in a SlottedPage
+
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
+    const allocator = arena.allocator();
 
     const SlottedPage = slotted_page(2, i32, i32);
 
     var page: SlottedPage = .empty;
-    try page.insert(arena.allocator(), 42, 1);
-    try page.insert(arena.allocator(), 0, 12);
+    try page.insert(allocator, 42, 1);
+    try page.insert(allocator, 0, 12);
 
     std.debug.print("{any}\n", .{page.get(0)});
     std.debug.print("{any}\n", .{page.get(42)});
@@ -39,7 +59,8 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             // here we take the sqlite approach and keep the next ptr in the header
             right_ptr: ?*Self = null,
 
-            // freeblocks: []usize
+            // keeps track of cells which are stale
+            // freeblocks: [fanout]usize = undefined,
         };
 
         const Cell = struct {
@@ -134,13 +155,18 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             }
         };
 
+        /// indicates the given idx in cells is free
+        fn available(self: *Self, idx: usize) void {
+            _ = self;
+            _ = idx;
+        }
+
         fn get_leaf_page(self: *Self, t: *Traversal, key: k) !*Self {
             const kind = self.header.kind;
 
             switch (kind) {
                 .Leaf => return self,
                 .Internal => {
-                    // we never allocate so this cannot fail
                     const next = try t.binary_search_page(self, key);
                     return next.get_leaf_page(t, key);
                 },
@@ -148,26 +174,25 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
         }
 
         pub fn insert(self: *Self, gpa: std.mem.Allocator, key: k, value: v) !void {
-            if (self.idx == fanout) {
-                // should split
+            var t: Traversal = .{ .mode = .Insert, .gpa = gpa };
+            var leaf = try self.get_leaf_page(&t, key);
+
+            const next_idx = leaf.idx;
+
+            if (next_idx == fanout) {
+                // should split, checking the traversal breadcrumbs
+                // self.split_recursive(&t, gpa);
                 return error.OutOfBounds;
             }
 
-            var t: Traversal = .{ .mode = .Insert, .gpa = gpa };
-
-            var leaf = try self.get_leaf_page(&t, key);
-            try expect(leaf.header.kind == .Leaf);
-
             // NOTE: we're not doing left appends
-            leaf.offsets[leaf.idx] = .{ .idx = leaf.idx };
-            leaf.cells[leaf.idx] = .{ .key = key, .value = value };
+            leaf.offsets[next_idx] = .{ .idx = next_idx };
+            leaf.cells[next_idx] = .{ .key = key, .value = value };
 
             // FIXME: what if we always allocated here ? std.heap.FixedBufferAllocator.init(buffer: []u8)
             // and then kept this allocator local to the slotted page ?
             // still doesn't guarantee we'll get "append from right" behaviour
             // BUT: could use a fba on the corresponding slice to alloc...
-
-            // now reorder the leaf.offsets
 
             const cells: []const Cell = leaf.cells[0..];
             const offsets: []Offset = leaf.offsets[0..];
@@ -190,6 +215,35 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             const leaf = get_leaf_page(self_mut, &t, key) catch unreachable;
 
             return t.binary_search_value(leaf, key);
+        }
+
+        fn split(self: *Self, gpa: std.mem.Allocator) !struct { left: *Self, right: ?*Self } {
+            // happy path, no work
+            if (self.idx < fanout) {
+                return .{ .left = self, .right = null };
+            }
+
+            const left = self;
+
+            // note: no defer gpa.destroy(sibling_ptr) as we're using an arena allocator
+            const right = try gpa.create(Self);
+            right.* = .empty;
+
+            const half = @divFloor(fanout, 2);
+
+            //  offsets
+            const right_offsets = left.offsets[half..];
+            @memcpy(right.offsets[0 .. fanout - half], right_offsets);
+            left.idx = half;
+            right.idx = fanout - half;
+
+            // cells
+            for (right_offsets, 0..) |off, i| {
+                right.cells[i] = left.cells[off.idx];
+                left.available(off.idx);
+            }
+
+            return .{ .left = left, .right = right };
         }
     };
 }
