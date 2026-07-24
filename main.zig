@@ -11,11 +11,6 @@ const expect = std.testing.expect;
 // - make offset id for inserted the freelist.first
 // - only search over non-deleted cells
 //
-// splitting
-// - we can use the breadcrumbs to KNOW if a parent exists !
-// - at each depth, perform a split and update the parent with the new pages
-// - should it belong to the Traversal ? or another fn(self: *Self, t: *Traversal)?
-//
 // allocation
 // fba in a slice to page align ? std.heap.FixedBufferAllocator.init(buffer: []u8)
 // and then kept this allocator local to the slotted page ?
@@ -31,9 +26,9 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const SlottedPage = slotted_page(2, i32, i32);
+    const Page = SlottedPage(2, i32, i32);
 
-    var page: SlottedPage = .empty;
+    var page: Page = .empty;
     try page.insert(allocator, 42, 1);
     try page.insert(allocator, 0, 12);
 
@@ -43,19 +38,19 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("{any}", .{page});
 }
 
-fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type {
+fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
     return struct {
         header: Header,
 
         // FIXME: we don't need offsets as a struct, lets refacto
         offsets: [fanout]usize = undefined,
         cells: [fanout]Cell = undefined,
-        idx: usize = 0,
+        len: usize = 0,
 
         const Self = @This();
         const empty: Self = .{ .header = .{} };
 
-        fn first_key(self: Self) ?k {
+        fn firstKey(self: Self) ?k {
             // if (self.cells == null) {
             //     return null;
             // }
@@ -63,11 +58,11 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             return self.cells[self.offsets[0]].key;
         }
 
-        fn insertAssumeCapacity(self: *Self, idx: usize, cell: Cell) void {
-            _ = self;
-            _ = idx;
-            _ = cell;
-            // @memcpy some stuff and insert the cell
+        fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
+            @memcpy(self.offsets[idx + 1 .. self.len + 1], self.offsets[idx..self.len]);
+            // FIXME: replace all instances of self.len with self.next_idx()
+            self.cells[self.len] = cell;
+            self.len += 1;
         }
 
         const Header = struct {
@@ -124,21 +119,19 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
                 Search,
             };
 
-            const PageOrValue = union { value: v, page: *Self };
-
-            fn assert_mode_ok(self: Traversal) !void {
+            fn assertModeOk(self: Traversal) !void {
                 if (self.mode == .Insert and self.gpa == null) {
                     return error.MissingAllocator;
                 }
             }
 
-            fn free(self: *Traversal) void {
+            fn clearAndFree(self: *Traversal) void {
                 self.breadcrumbs.clearAndFree(self.gpa.?);
             }
 
             /// For a given depth retrieves the corresponding cell satisfying the needle query
             /// or returns none
-            fn binary_search_cell(self: *Traversal, page: *const Self, needle: k) ?Cell {
+            fn binarySearchCell(self: *Traversal, page: *const Self, needle: k) ?Cell {
                 _ = self;
 
                 const cells: []const Cell = page.cells[0..];
@@ -154,8 +147,8 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             }
 
             /// Finds the next page at depth N+1 to search for a given needle
-            fn binary_search_page(self: *Traversal, page: *const Self, needle: k) !*Self {
-                try self.assert_mode_ok();
+            fn binarySearchPage(self: *Traversal, page: *const Self, needle: k) !*Self {
+                try self.assertModeOk();
 
                 const cells: []const Cell = page.cells[0..];
 
@@ -190,34 +183,34 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             _ = idx;
         }
 
-        fn find_leaf(self: *Self, t: *Traversal, key: k) !*Self {
+        fn findLeaf(self: *Self, t: *Traversal, key: k) !*Self {
             const kind = self.header.kind;
 
             switch (kind) {
                 .Leaf => return self,
                 .Internal => {
-                    const next = try t.binary_search_page(self, key);
-                    return next.find_leaf(t, key);
+                    const next = try t.binarySearchPage(self, key);
+                    return next.findLeaf(t, key);
                 },
             }
         }
 
         pub fn insert(self: *Self, gpa: std.mem.Allocator, key: k, value: v) !void {
             var t: Traversal = .{ .mode = .Insert, .gpa = gpa };
-            defer t.free();
+            defer t.clearAndFree();
 
-            var leaf = try self.find_leaf(&t, key);
-            const next_idx = leaf.idx;
+            var leaf = try self.findLeaf(&t, key);
+            const end = leaf.len;
 
             // FIXME: replace this and the parent one with try_split(gpa, &t)
-            if (next_idx == fanout) {
-                const siblings = try self.split(gpa, &t);
+            if (end == fanout) {
+                const siblings = try self.splitRecursive(gpa, &t);
                 _ = siblings;
             }
 
             // NOTE: we're not doing left appends
-            leaf.offsets[next_idx] = next_idx;
-            leaf.cells[next_idx] = .{ .key = key, .value = value };
+            leaf.offsets[end] = end;
+            leaf.cells[end] = .{ .key = key, .value = value };
 
             const cells: []const Cell = leaf.cells[0..];
             const offsets: []usize = leaf.offsets[0..];
@@ -229,15 +222,21 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
                 CmpHelpers.lessThanFn,
             );
 
-            leaf.idx += 1;
+            leaf.len += 1;
         }
 
-        fn split(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !struct { left: *Self, right: *Self } {
-            expect(self.idx < fanout) catch return error.NoNeedToSplit;
+        const Siblings = struct { left: *Self, right: *Self };
+
+        // FIXME: we have a massive problem here !
+        // when doing right.cells[i] = left.cells[o] we're filling in the old spots,
+        // so subsequent insertions will either overwrite existing cells OR trigger segfault
+        // -> we need the free list
+        // IDEA: we can store the free list as a bitpacked thing as a single u32
+        // then when we split the right gets ~freelist
+        fn split(self: *Self, gpa: std.mem.Allocator) !Siblings {
+            expect(self.len >= fanout) catch return error.NoNeedToSplit;
 
             const left = self;
-
-            // NOTE: no defer gpa.destroy(sibling_ptr) as we're using an arena allocator
             const right = try gpa.create(Self);
             right.* = .empty;
 
@@ -246,30 +245,55 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
             //  offsets
             const right_offsets = left.offsets[half..];
             @memcpy(right.offsets[0 .. fanout - half], right_offsets);
-            left.idx = half;
-            right.idx = fanout - half;
+            left.len = half;
+            right.len = fanout - half;
 
             // cells
             for (right_offsets, 0..) |o, i| {
                 right.cells[i] = left.cells[o];
                 left.available(o);
-            }
-
-            // FIXME: we should switch on here; if NO parent exists then we're in the leaf and NEED a new parent !
-            // maybe we do a parent = if{} else{} ...
-            if (t.breadcrumbs.pop()) |crumb| {
-                const parent, const idx = crumb;
-
-                switch (parent.idx) {
-                    fanout => _ = try parent.split(gpa, t),
-                    else => _ = parent.insertAssumeCapacity(idx, .{
-                        .key = right.first_key().?,
-                        .next_page = right,
-                    }),
-                }
+                // right.available(compliment of left available cause of symmetry)
             }
 
             return .{ .left = left, .right = right };
+        }
+
+        fn splitRecursive(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !Siblings {
+            const siblings = try self.split(gpa);
+
+            var parent, var idx = t.breadcrumbs.pop() orelse blk: {
+                const root = try gpa.create(Self);
+                root.* = .empty;
+                break :blk .{ root, 0 };
+            };
+
+            // hmmmm we need to check which parent we go in
+            // also that index we had before might be invalidated if we split
+            // NOTE: there was a note in the book about this i think (knowing which side)
+            const right = siblings.right;
+            const cell: Cell = .{
+                .key = right.firstKey().?,
+                .next_page = right,
+            };
+
+            switch (parent.len) {
+                fanout => {
+                    const parents = try parent.split(gpa);
+
+                    const side = if (idx < parents.left.len)
+                        parents.left
+                    else blk: {
+                        idx -= parents.left.len;
+                        break :blk parents.right;
+                    };
+
+                    side.insertAssumeOrdered(idx, cell);
+                },
+
+                else => parent.insertAssumeOrdered(idx, cell),
+            }
+
+            return siblings;
         }
 
         pub fn get(self: *const Self, key: k) ?v {
@@ -277,9 +301,9 @@ fn slotted_page(comptime fanout: usize, comptime k: type, comptime v: type) type
 
             // no allocations are done in search mode
             const self_mut: *Self = @constCast(self);
-            const leaf = find_leaf(self_mut, &t, key) catch unreachable;
+            const leaf = findLeaf(self_mut, &t, key) catch unreachable;
 
-            const cell = t.binary_search_cell(leaf, key) orelse return null;
+            const cell = t.binarySearchCell(leaf, key) orelse return null;
             return cell.value.?;
         }
     };
