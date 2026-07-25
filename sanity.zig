@@ -12,4 +12,9 @@ pub fn main() !void {
 
     const idx = std.sort.upperBound(u8, &nums, 4, S.cmp);
     try expect(idx == 3);
+
+    const bleh: u32 = 9;
+    const foo: u32 = 1;
+    const modif = bleh & ~(foo << @ctz(bleh));
+    std.debug.print("{any}\n", .{modif});
 }

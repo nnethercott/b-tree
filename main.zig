@@ -6,10 +6,6 @@ const expect = std.testing.expect;
 // - everything in one tightly coupled generic fn
 
 // TODO:
-// freelist impl;
-// - store available idx cells in a header field
-// - make offset id for inserted the freelist.first
-// - only search over non-deleted cells
 //
 // allocation
 // fba in a slice to page align ? std.heap.FixedBufferAllocator.init(buffer: []u8)
@@ -29,33 +25,51 @@ pub fn main(init: std.process.Init) !void {
     const Page = SlottedPage(2, i32, i32);
 
     var page: Page = .empty;
-    try page.insert(allocator, 42, 1);
-    try page.insert(allocator, 0, 12);
+    try page.insert(allocator, 2, 2);
+    try page.insert(allocator, 0, 0);
+    try page.insert(allocator, 3, 3);
+    try page.insert(allocator, 1, 1);
 
     std.debug.print("{any}\n", .{page.get(0)});
-    std.debug.print("{any}\n", .{page.get(42)});
-
+    std.debug.print("{any}\n", .{page.get(1)});
+    // std.debug.print("{any}\n", .{page.get(2)});
     std.debug.print("{any}", .{page});
 }
 
 fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
     return struct {
         header: Header,
-
-        // FIXME: we don't need offsets as a struct, lets refacto
         offsets: [fanout]usize = undefined,
         cells: [fanout]Cell = undefined,
         len: usize = 0,
 
         const Self = @This();
-        const empty: Self = .{ .header = .{} };
+        const empty: Self = .{ .header = .leaf };
 
         fn firstKey(self: Self) ?k {
-            // if (self.cells == null) {
-            //     return null;
-            // }
-
+            if (self.len == 0) {
+                return null;
+            }
             return self.cells[self.offsets[0]].key;
+        }
+
+        fn lastKey(self: Self) ?k {
+            if (self.len == 0) {
+                return null;
+            }
+            return self.cells[self.offsets[self.len - 1]].key;
+        }
+
+        fn rightPage(self: Self) ?*Self {
+            return self.header.right_page;
+        }
+
+        fn full(self: Self) bool {
+            switch (self.header.kind) {
+                .Leaf => return self.len == fanout,
+                .Internal => return (self.len == fanout and self.header.right_page != null),
+            }
+            return self.len == fanout;
         }
 
         fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
@@ -65,25 +79,52 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
             self.len += 1;
         }
 
+        /// Indicates the given idx in cells is free
+        fn available(self: *Self, idx: usize) void {
+            const one: @TypeOf(self.header.freeblocks) = @intCast(1);
+            self.header.freeblocks |= (one << @as(u5, @intCast(idx)));
+        }
+
+        // Retrieves the next available index in the page.
+        fn nextFreeIdx(self: *Self) ?usize {
+            // TODO: do smth with fanout as a protective measure
+            // so mask= freeblocks + 1 splat(fanout) and 0's above
+            const ptr = &self.header.freeblocks;
+            const mask = ptr.*;
+
+            if (mask != 0) {
+                const i = @ctz(mask);
+                const one: u32 = @intCast(1);
+                ptr.* = mask & ~(one << @as(u5, @intCast(i)));
+                return i;
+            }
+
+            return null;
+        }
+
         const Header = struct {
             const CellKind = enum {
                 Internal,
                 Leaf,
             };
 
-            kind: CellKind = .Leaf,
+            kind: CellKind,
 
             // each cell stores a pointer to the page where keys are lte than it.
             // here we take the sqlite approach and keep the next ptr in the header
-            right_ptr: ?*Self = null,
+            right_page: ?*Self = null,
 
-            // keeps track of cells which are stale
-            // freeblocks: [fanout]usize = undefined,
+            /// keeps track of available indexes in the page.cells array
+            /// could make this a `comptime_int`
+            freeblocks: u32 = 0,
+
+            const internal: Header = .{ .kind = .Internal };
+            const leaf: Header = .{ .kind = .Leaf };
         };
 
         const Cell = struct {
-            key_size: usize = @sizeOf(k),
             key: k,
+            // key_size: usize = @sizeOf(k),
 
             /// case: `CellKind.Leaf`
             value: ?v = null,
@@ -95,12 +136,14 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
         };
 
         const CmpHelpers = struct {
-            fn lessThanFn(ctx: struct { k, []const Cell }, lhs: usize, rhs: usize) bool {
-                return ctx[1][lhs].key < ctx[1][rhs].key;
+            const Ctx = struct { key: k, cells: []const Cell };
+
+            fn lessThanFn(ctx: Ctx, lhs: usize, rhs: usize) bool {
+                return ctx.cells[lhs].key < ctx.cells[rhs].key;
             }
 
-            fn cmpKey(ctx: struct { k, []const Cell }, off: usize) std.math.Order {
-                return std.math.order(ctx[0], ctx[1][off].key);
+            fn cmpKey(ctx: Ctx, off: usize) std.math.Order {
+                return std.math.order(ctx.key, ctx.cells[off].key);
             }
         };
 
@@ -135,11 +178,12 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
                 _ = self;
 
                 const cells: []const Cell = page.cells[0..];
+                const offsets: []const usize = page.offsets[0..page.len];
 
                 const idx = std.sort.binarySearch(
                     usize,
-                    page.offsets[0..],
-                    .{ needle, cells },
+                    offsets,
+                    CmpHelpers.Ctx{ .key = needle, .cells = cells },
                     CmpHelpers.cmpKey,
                 ) orelse return null;
 
@@ -151,21 +195,22 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
                 try self.assertModeOk();
 
                 const cells: []const Cell = page.cells[0..];
+                const offsets: []const usize = page.offsets[0..page.len];
 
                 const offset_idx = std.sort.upperBound(
                     usize,
-                    page.offsets[0..],
-                    .{ needle, cells },
+                    offsets,
+                    CmpHelpers.Ctx{ .key = needle, .cells = cells },
                     CmpHelpers.cmpKey,
                 );
 
                 const found, const idx = blk: {
                     if (offset_idx < cells.len) {
-                        const idx = page.offsets[offset_idx];
-                        break :blk .{ page.cells[idx].next_page.?, idx };
+                        const cell_idx = page.offsets[offset_idx];
+                        break :blk .{ page.cells[cell_idx].next_page.?, offset_idx };
                     }
                     // otherwise item is on the right
-                    break :blk .{ page.header.right_ptr.?, cells.len };
+                    break :blk .{ page.rightPage().?, cells.len };
                 };
 
                 switch (self.mode) {
@@ -176,12 +221,6 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
                 return found;
             }
         };
-
-        /// indicates the given idx in cells is free
-        fn available(self: *Self, idx: usize) void {
-            _ = self;
-            _ = idx;
-        }
 
         fn findLeaf(self: *Self, t: *Traversal, key: k) !*Self {
             const kind = self.header.kind;
@@ -200,45 +239,43 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
             defer t.clearAndFree();
 
             var leaf = try self.findLeaf(&t, key);
-            const end = leaf.len;
 
-            // FIXME: replace this and the parent one with try_split(gpa, &t)
-            if (end == fanout) {
-                const siblings = try self.splitRecursive(gpa, &t);
-                _ = siblings;
+            if (leaf.full()) {
+                std.debug.print("splitting\n", .{});
+                const siblings = try leaf.splitCascade(gpa, &t);
+
+                if (siblings.right.firstKey().? > key) {
+                    leaf = siblings.left;
+                } else {
+                    leaf = siblings.right;
+                }
             }
 
-            // NOTE: we're not doing left appends
-            leaf.offsets[end] = end;
-            leaf.cells[end] = .{ .key = key, .value = value };
+            const cell_idx = leaf.nextFreeIdx() orelse self.len;
+            leaf.offsets[leaf.len] = cell_idx;
+            leaf.cells[cell_idx] = .{ .key = key, .value = value };
+
+            leaf.len += 1;
 
             const cells: []const Cell = leaf.cells[0..];
-            const offsets: []usize = leaf.offsets[0..];
+            const offsets: []usize = leaf.offsets[0..self.len];
 
             std.sort.heap(
                 usize,
                 offsets,
-                .{ key, cells },
+                CmpHelpers.Ctx{ .key = key, .cells = cells },
                 CmpHelpers.lessThanFn,
             );
-
-            leaf.len += 1;
         }
 
         const Siblings = struct { left: *Self, right: *Self };
 
-        // FIXME: we have a massive problem here !
-        // when doing right.cells[i] = left.cells[o] we're filling in the old spots,
-        // so subsequent insertions will either overwrite existing cells OR trigger segfault
-        // -> we need the free list
-        // IDEA: we can store the free list as a bitpacked thing as a single u32
-        // then when we split the right gets ~freelist
         fn split(self: *Self, gpa: std.mem.Allocator) !Siblings {
-            expect(self.len >= fanout) catch return error.NoNeedToSplit;
+            expect(self.len == fanout) catch return error.NoNeedToSplit;
 
             const left = self;
             const right = try gpa.create(Self);
-            right.* = .empty;
+            right.* = .{ .header = .{ .kind = left.header.kind } };
 
             const half = @divFloor(fanout, 2);
 
@@ -249,48 +286,55 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
             right.len = fanout - half;
 
             // cells
-            for (right_offsets, 0..) |o, i| {
-                right.cells[i] = left.cells[o];
+            for (right_offsets) |o| {
+                right.cells[o] = left.cells[o];
                 left.available(o);
-                // right.available(compliment of left available cause of symmetry)
             }
+            for (left.offsets[0..half]) |o| {
+                right.available(o);
+            }
+
+            // NOTE: this only works if the key is numeric :// for + 1
+            // if (left.rightPage()) |page| {
+            //     const idx = right.nextFreeIdx().?;
+            //     right.cells[idx] = .{ .key = right.lastKey().?, .next_page = page };
+            //     left.header.right_page = null;
+            // }
 
             return .{ .left = left, .right = right };
         }
 
-        fn splitRecursive(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !Siblings {
+        // NOTE: we're still not doing anything with new roots ! we should promote them somewhere, new nodes
+        // created here are floating around untracked
+        fn splitCascade(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !Siblings {
             const siblings = try self.split(gpa);
+            const right = siblings.right;
 
-            var parent, var idx = t.breadcrumbs.pop() orelse blk: {
+            var parent, var offset_idx = t.breadcrumbs.pop() orelse blk: {
                 const root = try gpa.create(Self);
-                root.* = .empty;
+                root.* = .{ .header = .internal };
                 break :blk .{ root, 0 };
             };
 
-            // hmmmm we need to check which parent we go in
-            // also that index we had before might be invalidated if we split
-            // NOTE: there was a note in the book about this i think (knowing which side)
-            const right = siblings.right;
             const cell: Cell = .{
                 .key = right.firstKey().?,
                 .next_page = right,
             };
 
-            switch (parent.len) {
-                fanout => {
-                    const parents = try parent.split(gpa);
+            if (parent.full()) {
+                const parents = try parent.splitCascade(gpa, t);
+                const side = if (offset_idx < parents.left.len)
+                    parents.left
+                else blk: {
+                    offset_idx -= parents.left.len;
+                    break :blk parents.right;
+                };
 
-                    const side = if (idx < parents.left.len)
-                        parents.left
-                    else blk: {
-                        idx -= parents.left.len;
-                        break :blk parents.right;
-                    };
-
-                    side.insertAssumeOrdered(idx, cell);
-                },
-
-                else => parent.insertAssumeOrdered(idx, cell),
+                side.insertAssumeOrdered(offset_idx, cell);
+            } else if (parent.len == fanout) {
+                parent.header.right_page = right;
+            } else {
+                parent.insertAssumeOrdered(offset_idx, cell);
             }
 
             return siblings;
