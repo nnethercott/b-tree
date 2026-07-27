@@ -297,6 +297,8 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
 
             const left = self;
             const right = try gpa.create(Self);
+            // defer gpa.destroy(right);
+
             right.* = .{ .header = .{ .kind = left.header.kind } };
 
             const half = @divFloor(fanout, 2);
@@ -382,13 +384,26 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
     };
 }
 
-test "internal pages" {
-    const gpa = std.testing.allocator;
-    const Page = SlottedPage(2, i32, i32);
+test "splits on leaf node" {
+    // NOTE: defer "Executes an expression unconditionally at scope exit."
+    // => if we put this in a helper we'd free the memory before running, no ?
+    var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer allocator.deinit();
+    const gpa = allocator.allocator();
 
-    // NOTE: this fails since the insert method assumes exists leaf nodes
-    var root: Page = .{
-        .header = .internal
-    };
+    const Page = SlottedPage(3, i32, i32);
+
+    var root: Page = .empty;
+    try root.insert(gpa, 1, 1);
     try root.insert(gpa, 0, 0);
+    try root.insert(gpa, 2, 2);
+
+    try std.testing.expect(root.full());
+    const siblings = try root.split(gpa);
+
+    const left = siblings.left;
+    const right = siblings.right;
+
+    try std.testing.expectEqualSlices(usize, left.offsets[0..left.len], &.{1});
+    try std.testing.expectEqualSlices(usize, right.offsets[0..right.len], &.{0,2});
 }
