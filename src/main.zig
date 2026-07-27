@@ -381,3 +381,14 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
         }
     };
 }
+
+test "internal pages" {
+    const gpa = std.testing.allocator;
+    const Page = SlottedPage(2, i32, i32);
+
+    // NOTE: this fails since the insert method assumes exists leaf nodes
+    var root: Page = .{
+        .header = .internal
+    };
+    try root.insert(gpa, 0, 0);
+}
