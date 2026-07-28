@@ -17,14 +17,14 @@ const expect = std.testing.expect;
 // - [fanout]Cell is presumably allocated on the stack; how then do we get page alignment and why does that matter?
 //    - ^for me its related to mmapping some data structure ? so that the corresponding pages bring in a SlottedPage
 // - (zig question) defer "Executes an expression unconditionally at scope exit."
-//    => if we put this in a helper we'd free the memory before running, no ?
+//    => if we put this in a test helper we'd free the memory before running, no ?
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const Page = SlottedPage(2, i32, i32);
+    const Page = SlottedPage(4, i32, i32);
 
     var page: Page = .empty;
     try page.insert(allocator, 2, 2);
@@ -39,6 +39,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
+    // FIXME: comptime fn() comptime_int returning fanout from k, v as a default value
+    // FIXME: add signature like .init(gpa, &cmpKey) ?
+
     return struct {
         header: Header,
         offsets: [fanout]usize = undefined,
@@ -82,6 +85,16 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             return self.cells[0..];
         }
 
+        /// Appends a cell unordered
+        fn pushAssumeCapacity(self: *Self, cell: Cell) void {
+            const cell_idx = self.nextFreeIdx() orelse self.len;
+            self.offsets[self.len] = cell_idx;
+            self.cells[cell_idx] = cell;
+            self.len += 1;
+        }
+
+        /// Inserts a cell at a specific position in the page, or in the header if at capacity
+        // FIXME: test this at the edge case for internal node when idx == fanout
         fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
             if (self.len == fanout) {
                 if (idx == fanout) {
@@ -194,12 +207,6 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                 Search,
             };
 
-            fn assertModeOk(self: *const Traversal) !void {
-                if (self.mode == .Insert and self.gpa == null) {
-                    return error.MissingAllocator;
-                }
-            }
-
             fn clearAndFree(self: *Traversal) void {
                 self.breadcrumbs.clearAndFree(self.gpa.?);
             }
@@ -224,8 +231,6 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
             /// Finds the next page at depth N+1 to search for a given needle
             fn binarySearchPage(self: *Traversal, page: *const Self, needle: k) !*Self {
-                try self.assertModeOk();
-
                 const offsets = page.offsetsSlice();
                 const cells = page.cellsSlice();
 
@@ -283,19 +288,12 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                 }
             }
 
-            const cell_idx = leaf.nextFreeIdx() orelse self.len;
-            leaf.offsets[leaf.len] = cell_idx;
-            leaf.cells[cell_idx] = .{ .key = key, .value = value };
-
-            leaf.len += 1;
-
-            const cells: []const Cell = leaf.cells[0..];
-            const offsets: []usize = leaf.offsets[0..self.len];
+            leaf.pushAssumeCapacity(.{ .key = key, .value = value });
 
             std.sort.heap(
                 usize,
-                offsets,
-                CmpHelpers.Ctx{ .key = key, .cells = cells },
+                leaf.offsets[0..self.len],
+                CmpHelpers.Ctx{ .key = key, .cells = leaf.cellsSlice() },
                 CmpHelpers.lessThanFn,
             );
         }
@@ -307,39 +305,25 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
             const left = self;
             const right = try gpa.create(Self);
-            // defer gpa.destroy(right);
 
             right.* = .{ .header = .{ .kind = left.header.kind } };
 
             const half = @divFloor(fanout, 2);
 
-            //  offsets
-            const right_offsets = left.offsets[half..];
-            @memcpy(right.offsets[0 .. fanout - half], right_offsets);
+            for (left.offsets[half..], 0..) |o, i| {
+                right.cells[i] = left.cells[o];
+                right.offsets[i] = i;
+                left.available(o);
+            }
+
             left.len = half;
             right.len = fanout - half;
 
-            // cells
-            for (right_offsets) |o| {
-                right.cells[o] = left.cells[o];
-                left.available(o);
-            }
-            for (left.offsets[0..half]) |o| {
-                right.available(o);
-            }
-
-            // case: kind = .Internal and we have a right page set in the header
-            // we follow convention from the book which states "“The split point key is promoted to the parent”
-            // => page.firstKey() inserted into right
-            // SAFETY: this only gets called on internal nodes so page.firstKey() always non null
-
-            // FIXME: left.popRightPage() ?*Self
-            //FIXME: clean this
+            // We follow convention from the book which states "“The split point key is promoted to the parent”
             if (left.rightPage()) |page| {
-                const idx = right.nextFreeIdx().?;
-                right.cells[idx] = .{ .key = page.firstCell().?.key, .next_page = page };
-                right.offsets[right.len] = idx;
-                right.len += 1;
+                right.pushAssumeCapacity(
+                    .{ .key = page.firstCell().?.key, .next_page = page },
+                );
                 left.header.right_page = null;
             }
 
@@ -372,7 +356,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                     break :blk parents.right;
                 };
 
-                // TODO: write a test for this
+                // FIXME: write a test for this
                 // WARN: I'm unsure this case is handled properly:
                 // i. offset_idx == fanout (leaf was in right page of parent)
                 // ii. => we're in right sibling
@@ -421,10 +405,10 @@ test "splits on leaf node" {
     try std.testing.expectEqual(left.header.freeblocks, 5);
     try std.testing.expectEqual(left.cellsSlice()[1], Page.Cell{ .key = 0, .value = 0 });
 
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 2 });
-    try std.testing.expectEqual(right.header.freeblocks, 2);
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1 });
+    try std.testing.expectEqual(right.header.freeblocks, 0);
     try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 1, .value = 1 });
-    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 2, .value = 2 });
+    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 2, .value = 2 });
 }
 
 test "splits on internal node" {
@@ -461,9 +445,9 @@ test "splits on internal node" {
     try std.testing.expectEqual(left.header.freeblocks, 6);
     try std.testing.expectEqual(left.cellsSlice()[0], Page.Cell{ .key = 0 });
 
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 1, 2, 0 });
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1, 2 });
     try std.testing.expectEqual(right.header.freeblocks, 0);
-    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 1 });
-    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 2 });
-    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 3, .next_page = &right_page });
+    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 1 });
+    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 2 });
+    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 3, .next_page = &right_page });
 }
