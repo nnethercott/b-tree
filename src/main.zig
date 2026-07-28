@@ -15,7 +15,9 @@ const expect = std.testing.expect;
 
 // questions:
 // - [fanout]Cell is presumably allocated on the stack; how then do we get page alignment and why does that matter?
-// - ^for me its related to mmapping some data structure ? so that the corresponding pages bring in a SlottedPage
+//    - ^for me its related to mmapping some data structure ? so that the corresponding pages bring in a SlottedPage
+// - (zig question) defer "Executes an expression unconditionally at scope exit."
+//    => if we put this in a helper we'd free the memory before running, no ?
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -330,9 +332,14 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             // we follow convention from the book which states "“The split point key is promoted to the parent”
             // => page.firstKey() inserted into right
             // SAFETY: this only gets called on internal nodes so page.firstKey() always non null
+
+            // FIXME: left.popRightPage() ?*Self
+            //FIXME: clean this
             if (left.rightPage()) |page| {
                 const idx = right.nextFreeIdx().?;
                 right.cells[idx] = .{ .key = page.firstCell().?.key, .next_page = page };
+                right.offsets[right.len] = idx;
+                right.len += 1;
                 left.header.right_page = null;
             }
 
@@ -393,8 +400,6 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 }
 
 test "splits on leaf node" {
-    // NOTE: defer "Executes an expression unconditionally at scope exit."
-    // => if we put this in a helper we'd free the memory before running, no ?
     var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer allocator.deinit();
     const gpa = allocator.allocator();
@@ -413,7 +418,13 @@ test "splits on leaf node" {
     const right = siblings.right;
 
     try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{1});
+    try std.testing.expectEqual(left.header.freeblocks, 5);
+    try std.testing.expectEqual(left.cellsSlice()[1], Page.Cell{ .key = 0, .value = 0 });
+
     try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 2 });
+    try std.testing.expectEqual(right.header.freeblocks, 2);
+    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 1, .value = 1 });
+    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 2, .value = 2 });
 }
 
 test "splits on internal node" {
@@ -433,17 +444,26 @@ test "splits on internal node" {
         },
         .offsets = .{ 0, 1, 2 },
         .cells = .{
-            .{ .key = 0, .value = 0 },
-            .{ .key = 1, .value = 1 },
-            .{ .key = 2, .value = 2 },
+            .{ .key = 0 },
+            .{ .key = 1 },
+            .{ .key = 2 },
         },
         .len = 3,
     };
+
+    try std.testing.expect(internal.full());
 
     const siblings = try internal.split(gpa);
     const left = siblings.left;
     const right = siblings.right;
 
     try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{0});
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 1, 2, 3 });
+    try std.testing.expectEqual(left.header.freeblocks, 6);
+    try std.testing.expectEqual(left.cellsSlice()[0], Page.Cell{ .key = 0 });
+
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 1, 2, 0 });
+    try std.testing.expectEqual(right.header.freeblocks, 0);
+    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 1 });
+    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 2 });
+    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 3, .next_page = &right_page });
 }
