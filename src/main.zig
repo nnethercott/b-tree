@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("{any}", .{page});
 }
 
-fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
+pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
     return struct {
         header: Header,
         offsets: [fanout]usize = undefined,
@@ -44,32 +44,40 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
         len: usize = 0,
 
         const Self = @This();
-        const empty: Self = .{ .header = .leaf };
+        pub const empty: Self = .{ .header = .leaf };
 
-        fn firstCell(self: Self) ?Cell {
+        fn firstCell(self: *const Self) ?Cell {
             if (self.len == 0) {
                 return null;
             }
             return self.cells[self.offsets[0]];
         }
 
-        fn lastCell(self: Self) ?Cell {
+        fn lastCell(self: *const Self) ?Cell {
             if (self.len == 0) {
                 return null;
             }
             return self.cells[self.offsets[self.len - 1]];
         }
 
-        fn rightPage(self: Self) ?*Self {
+        fn rightPage(self: *const Self) ?*Self {
             return self.header.right_page;
         }
 
-        fn full(self: Self) bool {
+        fn full(self: *const Self) bool {
             switch (self.header.kind) {
                 .Leaf => return self.len == fanout,
                 .Internal => return (self.len == fanout and self.header.right_page != null),
             }
             return self.len == fanout;
+        }
+
+        fn offsetsSlice(self: *const Self) []const usize {
+            return self.offsets[0..self.len];
+        }
+
+        fn cellsSlice(self: *const Self) []const Cell {
+            return self.cells[0..];
         }
 
         fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
@@ -184,7 +192,7 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
                 Search,
             };
 
-            fn assertModeOk(self: Traversal) !void {
+            fn assertModeOk(self: *const Traversal) !void {
                 if (self.mode == .Insert and self.gpa == null) {
                     return error.MissingAllocator;
                 }
@@ -199,8 +207,8 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
             fn binarySearchCell(self: *Traversal, page: *const Self, needle: k) ?Cell {
                 _ = self;
 
-                const cells: []const Cell = page.cells[0..];
-                const offsets: []const usize = page.offsets[0..page.len];
+                const offsets = page.offsetsSlice();
+                const cells = page.cellsSlice();
 
                 const idx = std.sort.binarySearch(
                     usize,
@@ -216,8 +224,8 @@ fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type 
             fn binarySearchPage(self: *Traversal, page: *const Self, needle: k) !*Self {
                 try self.assertModeOk();
 
-                const cells: []const Cell = page.cells[0..];
-                const offsets: []const usize = page.offsets[0..page.len];
+                const offsets = page.offsetsSlice();
+                const cells = page.cellsSlice();
 
                 const offset_idx = std.sort.upperBound(
                     usize,
@@ -399,11 +407,43 @@ test "splits on leaf node" {
     try root.insert(gpa, 2, 2);
 
     try std.testing.expect(root.full());
-    const siblings = try root.split(gpa);
 
+    const siblings = try root.split(gpa);
     const left = siblings.left;
     const right = siblings.right;
 
-    try std.testing.expectEqualSlices(usize, left.offsets[0..left.len], &.{1});
-    try std.testing.expectEqualSlices(usize, right.offsets[0..right.len], &.{0,2});
+    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{1});
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 2 });
+}
+
+test "splits on internal node" {
+    var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer allocator.deinit();
+    const gpa = allocator.allocator();
+
+    const Page = SlottedPage(3, i32, i32);
+
+    var right_page: Page = .empty;
+    try right_page.insert(gpa, 3, 3);
+
+    var internal: Page = .{
+        .header = .{
+            .kind = .Internal,
+            .right_page = &right_page,
+        },
+        .offsets = .{ 0, 1, 2 },
+        .cells = .{
+            .{ .key = 0, .value = 0 },
+            .{ .key = 1, .value = 1 },
+            .{ .key = 2, .value = 2 },
+        },
+        .len = 3,
+    };
+
+    const siblings = try internal.split(gpa);
+    const left = siblings.left;
+    const right = siblings.right;
+
+    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{0});
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 1, 2, 3 });
 }
