@@ -301,44 +301,42 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             );
         }
 
-        const Siblings = struct { left: *Self, right: *Self };
+        fn split(self: *Self, gpa: std.mem.Allocator) !?*Self {
+            if (!self.full()) {
+                return null;
+            }
 
-        fn split(self: *Self, gpa: std.mem.Allocator) !Siblings {
-            expect(self.len == fanout) catch return error.NoNeedToSplit;
-
-            const left = self;
             const right = try gpa.create(Self);
 
-            right.* = .{ .header = .{ .kind = left.header.kind } };
+            right.* = .{ .header = .{ .kind = self.header.kind } };
 
             // hacky @divCeil in zig 0.16
             const half = @divFloor(fanout, 2) + (fanout % 2);
 
-            for (left.offsets[half..], 0..) |o, i| {
-                right.cells[i] = left.cells[o];
+            for (self.offsets[half..], 0..) |o, i| {
+                right.cells[i] = self.cells[o];
                 right.offsets[i] = i;
-                left.available(o);
+                self.available(o);
             }
 
-            left.len = half;
+            self.len = half;
             right.len = fanout - half;
 
             // We follow convention from the book which states "“The split point key is promoted to the parent”
-            if (left.rightPage()) |page| {
+            if (self.rightPage()) |page| {
                 right.pushAssumeCapacity(
                     .{ .key = page.firstCell().?.key, .next_page = page },
                 );
-                left.header.right_page = null;
+                self.header.right_page = null;
             }
 
-            return .{ .left = left, .right = right };
+            return right;
         }
 
         // NOTE: we're still not doing anything with new roots ! we should promote them somewhere, new nodes
         // created here are floating around untracked
-        fn splitCascade(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !Siblings {
-            const siblings = try self.split(gpa);
-            const right = siblings.right;
+        fn splitCascade(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !struct { left: *Self, right: *Self } {
+            const right = try self.split(gpa) orelse self;
 
             var parent, var offset_idx = t.breadcrumbs.pop() orelse blk: {
                 const root = try gpa.create(Self);
@@ -364,7 +362,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                 parent.insertAssumeOrdered(offset_idx, cell);
             }
 
-            return siblings;
+            return .{ .left = self, .right = right };
         }
 
         pub fn get(self: *const Self, key: k) ?v {
@@ -400,9 +398,8 @@ test "splits on leaf node" {
 
     try std.testing.expect(root.full());
 
-    const siblings = try root.split(gpa);
-    const left = siblings.left;
-    const right = siblings.right;
+    const right = try root.split(gpa) orelse unreachable;
+    const left = root;
 
     try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{ 1, 0 });
     try std.testing.expectEqual(left.header.freeblocks, 4);
@@ -440,9 +437,8 @@ test "splits on internal node" {
 
     try std.testing.expect(internal.full());
 
-    const siblings = try internal.split(gpa);
-    const left = siblings.left;
-    const right = siblings.right;
+    const right = try internal.split(gpa) orelse unreachable;
+    const left = internal;
 
     try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{ 0, 1 });
     try std.testing.expectEqual(left.header.freeblocks, 4);
