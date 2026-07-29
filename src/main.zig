@@ -311,7 +311,8 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
             right.* = .{ .header = .{ .kind = left.header.kind } };
 
-            const half = @divFloor(fanout, 2);
+            // hacky @divCeil in zig 0.16
+            const half = @divFloor(fanout, 2) + (fanout % 2);
 
             for (left.offsets[half..], 0..) |o, i| {
                 right.cells[i] = left.cells[o];
@@ -403,14 +404,14 @@ test "splits on leaf node" {
     const left = siblings.left;
     const right = siblings.right;
 
-    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{1});
-    try std.testing.expectEqual(left.header.freeblocks, 5);
+    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{ 1, 0 });
+    try std.testing.expectEqual(left.header.freeblocks, 4);
     try std.testing.expectEqual(left.cellsSlice()[1], Page.Cell{ .key = 0, .value = 0 });
+    try std.testing.expectEqual(left.cellsSlice()[0], Page.Cell{ .key = 1, .value = 1 });
 
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1 });
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{0});
     try std.testing.expectEqual(right.header.freeblocks, 0);
-    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 1, .value = 1 });
-    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 2, .value = 2 });
+    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 2, .value = 2 });
 }
 
 test "splits on internal node" {
@@ -443,15 +444,15 @@ test "splits on internal node" {
     const left = siblings.left;
     const right = siblings.right;
 
-    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{0});
-    try std.testing.expectEqual(left.header.freeblocks, 6);
+    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{ 0, 1 });
+    try std.testing.expectEqual(left.header.freeblocks, 4);
     try std.testing.expectEqual(left.cellsSlice()[0], Page.Cell{ .key = 0 });
+    try std.testing.expectEqual(left.cellsSlice()[1], Page.Cell{ .key = 1 });
 
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1, 2 });
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1 });
     try std.testing.expectEqual(right.header.freeblocks, 0);
-    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 1 });
-    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 2 });
-    try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 3, .next_page = &right_page });
+    try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 2 });
+    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 3, .next_page = &right_page });
 }
 
 test "inserts at capacity and ordered" {
