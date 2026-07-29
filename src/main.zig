@@ -85,16 +85,16 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             return self.cells[0..];
         }
 
-        /// Appends a cell unordered
+        /// Appends a cell unordered. Caller must ensure sorting of `offsets` afterwards
         fn pushAssumeCapacity(self: *Self, cell: Cell) void {
-            const cell_idx = self.nextFreeIdx() orelse self.len;
-            self.offsets[self.len] = cell_idx;
-            self.cells[cell_idx] = cell;
+            const idx = self.nextFreeIdx() orelse self.len;
+            self.offsets[self.len] = idx;
+            self.cells[idx] = cell;
             self.len += 1;
         }
 
-        /// Inserts a cell at a specific position in the page, or in the header if at capacity
-        // FIXME: test this at the edge case for internal node when idx == fanout
+        /// Inserts a cell at a specific position in the page, or in the header if at capacity.
+        /// The insertion `idx` is assumed to be such that cell ordering is preserved
         fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
             if (self.len == fanout) {
                 if (idx == fanout) {
@@ -102,8 +102,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                     return;
                 }
 
-                const last_cell = self.lastCell().?;
-                self.header.right_page = last_cell.next_page;
+                self.header.right_page = self.lastCell().?.next_page;
 
                 // SAFETY: this signals in the subsequent op that the cell we just copied
                 // over can be overwritten. We take the convention that insertion into the
@@ -111,9 +110,13 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                 self.len -= 1;
             }
 
+            // shift offsets to the right by 1
             @memcpy(self.offsets[idx + 1 .. self.len + 1], self.offsets[idx..self.len]);
-            // FIXME: replace all instances of self.len with self.next_idx()
-            self.cells[self.len] = cell;
+
+            const cell_idx = self.nextFreeIdx() orelse self.len;
+
+            self.offsets[idx] = cell_idx;
+            self.cells[cell_idx] = cell;
             self.len += 1;
         }
 
@@ -355,13 +358,6 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                     offset_idx -= parents.left.len;
                     break :blk parents.right;
                 };
-
-                // FIXME: write a test for this
-                // WARN: I'm unsure this case is handled properly:
-                // i. offset_idx == fanout (leaf was in right page of parent)
-                // ii. => we're in right sibling
-                // iii. => is offset_idx - parents.left.len valid ? or will it overwrite
-                //         data from insertAssumeOrdered ?
                 side.insertAssumeOrdered(offset_idx, cell);
             } else {
                 parent.insertAssumeOrdered(offset_idx, cell);
@@ -373,7 +369,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
         pub fn get(self: *const Self, key: k) ?v {
             var t: Traversal = .{ .mode = .Search };
 
-            // no allocations are done in search mode
+            // SAFETY: no allocations are done in search mode
             const self_mut: *Self = @constCast(self);
             const leaf = findLeaf(self_mut, &t, key) catch unreachable;
 
@@ -390,10 +386,16 @@ test "splits on leaf node" {
 
     const Page = SlottedPage(3, i32, i32);
 
-    var root: Page = .empty;
-    try root.insert(gpa, 1, 1);
-    try root.insert(gpa, 0, 0);
-    try root.insert(gpa, 2, 2);
+    var root: Page = .{
+        .header = .leaf,
+        .offsets = .{ 1, 0, 2 },
+        .cells = .{
+            .{ .key = 1, .value = 1 },
+            .{ .key = 0, .value = 0 },
+            .{ .key = 2, .value = 2 },
+        },
+        .len = 3,
+    };
 
     try std.testing.expect(root.full());
 
@@ -451,3 +453,51 @@ test "splits on internal node" {
     try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 2 });
     try std.testing.expectEqual(right.cellsSlice()[2], Page.Cell{ .key = 3, .next_page = &right_page });
 }
+
+test "inserts at capacity and ordered" {
+    const Page = SlottedPage(3, i32, i32);
+
+    var root: Page = .{ .header = .internal };
+    root.offsets[0..2].* = .{ 0, 1 };
+    root.cells[0..2].* = .{ .{ .key = 0 }, .{ .key = 1 } };
+    root.len = 2;
+
+    // insert with room in self.cells
+    var cell: Page.Cell = .{ .key = 2 };
+    root.insertAssumeOrdered(2, cell);
+    try std.testing.expectEqualSlices(usize, root.offsetsSlice(), &.{ 0, 1, 2 });
+    try std.testing.expectEqual(root.lastCell().?, cell);
+
+    // insert and occupy header.right_page
+    var leaf: Page = .{ .header = .leaf };
+    leaf.offsets[0] = 0;
+    leaf.cells[0] = .{ .key = 4, .value = 4 };
+    leaf.len = 1;
+
+    cell = .{ .key = leaf.firstCell().?.key, .next_page = &leaf };
+    try std.testing.expectEqual(root.rightPage(), null);
+    root.insertAssumeOrdered(3, cell);
+    try std.testing.expectEqual(root.rightPage(), &leaf);
+
+    // Insert but shift rightmost cell into header
+    // Setup:
+    // - replace last cell in `root` with the (cell, (leaf)) node
+    // - clear out right page
+    // - insert new element BEFORE `root.len`
+    // => cell in last slot should get bumped to the right
+    root.header.right_page = null;
+    root.cells[2] = cell;
+    root.insertAssumeOrdered(2, .{ .key = 3 });
+    try std.testing.expectEqual(root.cellsSlice()[2], Page.Cell{ .key = 3 });
+    try std.testing.expectEqual(root.rightPage(), &leaf);
+}
+
+// FIXME: write a test for splitCascade
+// WARN: I'm unsure this case is handled properly:
+// i. offset_idx == fanout (leaf was in right page of parent)
+// ii. => we're in right sibling
+// FIXME: add test for inserts where we check node
+// try root.insert(gpa, 1, 1);
+// try root.insert(gpa, 0, 0);
+// try root.insert(gpa, 2, 2);
+// FIXME: test traversal
