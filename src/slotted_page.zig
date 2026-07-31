@@ -15,18 +15,20 @@ const expect = std.testing.expect;
 // - (zig question) defer "Executes an expression unconditionally at scope exit."
 //    => if we put this in a test helper we'd free the memory before running, no ?
 
-pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) type {
+pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type) type {
     // FIXME: comptime fn() comptime_int returning fanout from k, v as a default value
     // FIXME: add signature like .init(gpa, &cmpKey) ?
 
     return struct {
         header: Header,
-        offsets: [fanout]usize = undefined,
-        cells: [fanout]Cell = undefined,
+        offsets: [capacity]usize = undefined,
+        cells: [capacity]Cell = undefined,
         len: usize = 0,
 
         const Self = @This();
         pub const empty: Self = .{ .header = .leaf };
+
+        const MAGIC_OFFSET: comptime_int = capacity + 1;
 
         fn firstCell(self: *const Self) ?Cell {
             if (self.len == 0) {
@@ -48,10 +50,9 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
         fn full(self: *const Self) bool {
             switch (self.header.kind) {
-                .Leaf => return self.len == fanout,
-                .Internal => return (self.len == fanout and self.header.right_page != null),
+                .Leaf => return self.len == capacity,
+                .Internal => return (self.len == capacity and self.header.right_page != null),
             }
-            return self.len == fanout;
         }
 
         fn offsetsSlice(self: *const Self) []const usize {
@@ -70,30 +71,31 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             self.len += 1;
         }
 
-        /// Inserts a cell at a specific position in the page, or in the header if at capacity.
-        /// The insertion `idx` is assumed to be such that cell ordering is preserved
-        fn insertAssumeOrdered(self: *Self, idx: usize, cell: Cell) void {
-            if (self.len == fanout) {
-                if (idx == fanout) {
-                    self.header.right_page = cell.next_page;
-                    return;
-                }
+        fn insertSiblings(self: *Self, idx: usize, left: *Self, right: *Self) void {
+            const cell_idx = self.nextFreeIdx() orelse self.len;
+            const cell: Cell = .{
+                .key = right.firstCell().?.key,
+                .next_page = left,
+            };
 
-                self.header.right_page = self.lastCell().?.next_page;
+            if (idx == MAGIC_OFFSET) {
+                self.header.right_page = right;
 
-                // SAFETY: this signals in the subsequent op that the cell we just copied
-                // over can be overwritten. We take the convention that insertion into the
-                // right_page doesn't change `self.len`
-                self.len -= 1;
+                self.offsets[self.len] = cell_idx;
+                self.cells[cell_idx] = cell;
+                self.len += 1;
+
+                return;
             }
 
-            // shift offsets to the right by 1
+            // shift offsets to the right by 1 at idx to make room for new cell
             @memcpy(self.offsets[idx + 1 .. self.len + 1], self.offsets[idx..self.len]);
-
-            const cell_idx = self.nextFreeIdx() orelse self.len;
 
             self.offsets[idx] = cell_idx;
             self.cells[cell_idx] = cell;
+            // this cell already has the correct key, just change the page it points to
+            self.cells[self.offsets[idx + 1]].next_page = right;
+
             self.len += 1;
         }
 
@@ -129,7 +131,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             const leaf: Header = .{ .kind = .Leaf };
 
             /// should be like [0,0,..1,1,..1] where @popCount(num) == fanout
-            const FREEBLOCK_MASK: u32 = (1 << fanout) - 1;
+            const FREEBLOCK_MASK: u32 = (1 << capacity) - 1;
 
             fn nextFreeIdxMut(self: *Header) ?usize {
                 const ptr = &self.freeblocks;
@@ -197,7 +199,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
             /// For a given depth retrieves the corresponding cell satisfying the needle query
             /// or returns none
-            fn binarySearchCell(self: *Traversal, page: *const Self, needle: k) ?Cell {
+            fn binarySearchCell(self: *Traversal, page: *Self, needle: k) ?Cell {
                 _ = self;
 
                 const offsets = page.offsetsSlice();
@@ -214,7 +216,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             }
 
             /// Finds the next page at depth N+1 to search for a given needle
-            fn binarySearchPage(self: *Traversal, page: *const Self, needle: k) !*Self {
+            fn binarySearchPage(self: *Traversal, page: *Self, needle: k) !*Self {
                 const offsets = page.offsetsSlice();
                 const cells = page.cellsSlice();
 
@@ -226,16 +228,16 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
                 );
 
                 const found, const idx = blk: {
-                    if (offset_idx < fanout) {
+                    if (offset_idx < page.len) {
                         const cell_idx = offsets[offset_idx];
                         break :blk .{ cells[cell_idx].next_page.?, offset_idx };
                     }
                     // otherwise item is on the right
-                    break :blk .{ page.rightPage().?, fanout };
+                    break :blk .{ page.rightPage().?, MAGIC_OFFSET };
                 };
 
                 switch (self.mode) {
-                    .Insert => self.breadcrumbs.append(self.gpa.?, .{ found, idx }) catch return error.FailedToAllocate,
+                    .Insert => self.breadcrumbs.append(self.gpa.?, .{ page, idx }) catch return error.FailedToAllocate,
                     .Search => {},
                 }
 
@@ -283,7 +285,7 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
 
             std.sort.heap(
                 usize,
-                leaf.offsets[0..self.len],
+                leaf.offsets[0..leaf.len],
                 CmpHelpers.Ctx{ .key = key, .cells = leaf.cellsSlice() },
                 CmpHelpers.lessThanFn,
             );
@@ -294,12 +296,13 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
         fn split(self: *Self, gpa: std.mem.Allocator) !struct { *Self, *Self } {
             if (!self.full()) return error.NoNeedToSplit;
 
+            const kind = self.header.kind;
             const right = try gpa.create(Self);
 
-            right.* = .{ .header = .{ .kind = self.header.kind } };
+            right.* = .{ .header = .{ .kind = kind } };
 
             // hacky @divCeil in zig 0.16
-            const half = @divFloor(fanout, 2) + (fanout % 2);
+            const half: comptime_int = @divFloor(capacity, 2) + (capacity % 2);
 
             for (self.offsets[half..], 0..) |o, i| {
                 right.cells[i] = self.cells[o];
@@ -308,58 +311,64 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             }
 
             self.len = half;
-            right.len = fanout - half;
+            right.len = capacity - half;
 
-            // We follow convention from the book which states "“The split point key is promoted to the parent”
-            if (self.rightPage()) |page| {
-                right.pushAssumeCapacity(
-                    .{ .key = page.firstCell().?.key, .next_page = page },
-                );
-                self.header.right_page = null;
+            if (kind == .Internal) {
+                right.header.right_page = self.header.right_page;
+
+                const last_cell = self.lastCell().?;
+                self.header.right_page = last_cell.next_page;
+                self.available(self.len - 1);
+                self.len -= 1;
             }
 
             return .{ self, right };
         }
 
+        // FIXME: write tests for this when parents.full()
         fn splitCascade(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !struct { root: *Self, new_page: *Self } {
             var root = self;
 
-            _, const new = try self.split(gpa);
+            const left, const right = try self.split(gpa);
+            const crumb = t.breadcrumbs.pop();
 
-            const cell: Cell = .{
-                .key = new.firstCell().?.key,
-                .next_page = new,
-            };
-
-            var parent, var idx = t.breadcrumbs.pop() orelse blk: {
-                // create a new SlottedPage and insert ourselves in the first slot
-                const page = try gpa.create(Self);
-
-                page.* = .{ .header = .internal };
-                page.cells[0] = .{ .key = self.lastCell().?.key, .next_page = self };
-                page.offsets[0] = 0;
-                page.len = 1;
-
-                break :blk .{ page, 1 };
-            };
-
-            if (parent.full()) {
-                const items = try parent.splitCascade(gpa, t);
-                const side = if (idx < parent.len)
-                    parent
-                else blk: {
-                    idx -= parent.len;
-                    break :blk items.new_page;
+            if (crumb == null) {
+                // create a new SlottedPage with siblings
+                root = try gpa.create(Self);
+                root.* = .{
+                    .header = .{
+                        .kind = .Internal,
+                        .right_page = right,
+                    },
+                    .len = 1,
+                };
+                root.offsets[0] = 0;
+                root.cells[0] = .{
+                    .key = right.firstCell().?.key,
+                    .next_page = left,
                 };
 
-                side.insertAssumeOrdered(idx, cell);
-                root = items.root;
-            } else {
-                parent.insertAssumeOrdered(idx, cell);
-                root = parent;
+                return .{ .root = root, .new_page = right };
             }
 
-            return .{ .root = root, .new_page = new };
+            // otherwise use existing parent
+            var parent, const idx = crumb.?;
+
+            if (!parent.full()) {
+                parent.insertSiblings(idx, left, right);
+                root = parent;
+            } else {
+                const items = try parent.splitCascade(gpa, t);
+
+                if (idx < parent.len) {
+                    parent.insertSiblings(idx, left, right);
+                } else {
+                    items.new_page.insertSiblings(idx - parent.len, left, right);
+                }
+                root = items.root;
+            }
+
+            return .{ .root = root, .new_page = right };
         }
 
         pub fn get(self: *const Self, key: k) ?v {
@@ -368,6 +377,8 @@ pub fn SlottedPage(comptime fanout: usize, comptime k: type, comptime v: type) t
             // SAFETY: no allocations are done in search mode
             const self_mut: *Self = @constCast(self);
             const leaf = findLeaf(self_mut, &t, key) catch unreachable;
+
+            std.debug.print("{any}\n", .{leaf});
 
             const cell = t.binarySearchCell(leaf, key) orelse return null;
             return cell.value.?;
@@ -464,53 +475,59 @@ test "splits on internal node" {
 
     const left, const right = try internal.split(gpa);
 
-    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{ 0, 1 });
-    try std.testing.expectEqual(left.header.freeblocks, 4);
+    try std.testing.expectEqualSlices(usize, left.offsetsSlice(), &.{0});
+    try std.testing.expectEqual(left.header.freeblocks, 6);
     try std.testing.expectEqual(left.cellsSlice()[0], Page.Cell{ .key = 0 });
-    try std.testing.expectEqual(left.cellsSlice()[1], Page.Cell{ .key = 1 });
+    // NOTE: should check that Page.Cell{.key = 1 } in left.header.right_page ...
 
-    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{ 0, 1 });
+    try std.testing.expectEqualSlices(usize, right.offsetsSlice(), &.{0});
     try std.testing.expectEqual(right.header.freeblocks, 0);
     try std.testing.expectEqual(right.cellsSlice()[0], Page.Cell{ .key = 2 });
-    try std.testing.expectEqual(right.cellsSlice()[1], Page.Cell{ .key = 3, .next_page = &right_page });
+    try std.testing.expectEqual(right.header.right_page, &right_page);
 }
 
-test "inserts at capacity and ordered" {
-    const Page = SlottedPage(3, i32, i32);
+test "insert siblings" {
+    var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer allocator.deinit();
+    const gpa = allocator.allocator();
 
-    var root: Page = .{ .header = .internal };
-    root.offsets[0..2].* = .{ 0, 1 };
-    root.cells[0..2].* = .{ .{ .key = 0 }, .{ .key = 1 } };
-    root.len = 2;
+    const Page = SlottedPage(2, i32, i32);
 
-    // insert with room in self.cells
-    var cell: Page.Cell = .{ .key = 2 };
-    root.insertAssumeOrdered(2, cell);
-    try std.testing.expectEqualSlices(usize, root.offsetsSlice(), &.{ 0, 1, 2 });
-    try std.testing.expectEqual(root.lastCell().?, cell);
+    // setup
+    var left: Page = .empty;
+    _ = try left.insert(gpa, 0, 0);
+    _ = try left.insert(gpa, 1, 1);
 
-    // insert and occupy header.right_page
-    var leaf: Page = .{ .header = .leaf };
-    leaf.offsets[0] = 0;
-    leaf.cells[0] = .{ .key = 4, .value = 4 };
-    leaf.len = 1;
+    var right: Page = .empty;
+    _ = try right.insert(gpa, 2, 2);
+    _ = try right.insert(gpa, 3, 3);
 
-    cell = .{ .key = leaf.firstCell().?.key, .next_page = &leaf };
-    try std.testing.expectEqual(root.rightPage(), null);
-    root.insertAssumeOrdered(3, cell);
-    try std.testing.expectEqual(root.rightPage(), &leaf);
+    var root: Page = .{
+        .header = .{
+            .kind = .Internal,
+            .right_page = &right,
+        },
+        .len = 1,
+    };
+    root.cells[0] = .{ .key = 2, .next_page = &left };
+    root.offsets[0] = 0;
 
-    // Insert but shift rightmost cell into header
-    // Setup:
-    // - replace last cell in `root` with the (cell, (leaf)) node
-    // - clear out right page
-    // - insert new element BEFORE `root.len`
-    // => cell in last slot should get bumped to the right
-    root.header.right_page = null;
-    root.cells[2] = cell;
-    root.insertAssumeOrdered(2, .{ .key = 3 });
-    try std.testing.expectEqual(root.cellsSlice()[2], Page.Cell{ .key = 3 });
-    try std.testing.expectEqual(root.rightPage(), &leaf);
+    // insert without touching right branch
+    const left_left, const left_right = try left.split(gpa);
+    try std.testing.expectEqual(root.firstCell().?.key, 2);
+    root.insertSiblings(0, left_left, left_right);
+    try std.testing.expectEqual(root.firstCell().?.key, 1);
+    try std.testing.expectEqual(root.lastCell().?.key, 2);
+
+    // pretend like we didn't do the above
+    root.len -= 1;
+
+    // okay now split the item on the right
+    const right_left, const right_right = try right.split(gpa);
+    root.insertSiblings(Page.MAGIC_OFFSET, right_left, right_right);
+    try std.testing.expectEqual(root.lastCell().?.key, 3);
+    try std.testing.expectEqual(root.lastCell().?.next_page, right_left);
+    try std.testing.expectEqual(root.header.right_page, right_right);
 }
 
 // FIXME: write a test for splitCascade

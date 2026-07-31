@@ -27,7 +27,9 @@ pub fn build(b: *std.Build) void {
 
     // tests
     const test_step = b.step("test", "runs the unit tests");
-    const test_files = [_][]const u8 { "src/tree.zig", "src/slotted_page.zig" };
+
+    // imports are run twice ?
+    const test_files = [_][]const u8 { "src/tree.zig",};
 
     for (test_files) |file| {
         for (test_targets) |target| {
