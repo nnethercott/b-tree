@@ -73,6 +73,8 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
 
         fn insertSiblings(self: *Self, idx: usize, left: *Self, right: *Self) void {
             const cell_idx = self.nextFreeIdx() orelse self.len;
+            // NOTE: when you have a cell with just one header ptr this fails !
+            // case capacity = 1
             const cell: Cell = .{
                 .key = right.firstCell().?.key,
                 .next_page = left,

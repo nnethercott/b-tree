@@ -9,7 +9,7 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const gpa = arena.allocator();
 
-    const Tree = BTree(2, i32, i32);
+    const Tree = BTree(1, i32, i32);
 
     var tree: Tree = try .init(gpa);
     try tree.insert(gpa, 0, 0);
@@ -23,4 +23,6 @@ pub fn main(init: std.process.Init) !void {
     try tree.insert(gpa, 4, 4);
 
     std.debug.print("get {any}\n", .{tree.get(2)});
+    std.debug.print("get {any}\n", .{tree.root.cells[0]});
+    std.debug.print("get {any}\n", .{tree.root.header.right_page});
 }
