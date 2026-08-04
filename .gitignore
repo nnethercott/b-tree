@@ -3,3 +3,7 @@
 # zig build system artifacts
 .zig-cache/*
 zig-out/*
+zig-pkg/*
+
+# roaring source code
+roaring/*

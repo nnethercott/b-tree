@@ -3,10 +3,19 @@ const expect = std.testing.expect;
 
 const btree = @import("tree.zig");
 const page = @import("slotted_page.zig");
+const manager = @import("page_manager.zig");
+const r = @import("roaring.zig");
 
 const BTree = btree.BTree;
 
 pub fn main(init: std.process.Init) !void {
+    _ = init;
+    const bitset: manager.PageManager = .init();
+    r.roaring_bitmap_add(bitset.in_use, 1);
+    try expect(r.roaring_bitmap_contains(bitset.in_use, 1));
+}
+
+fn bleh(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -29,4 +38,5 @@ pub fn main(init: std.process.Init) !void {
     // std.debug.print("get {any}\n", .{tree.get(2)});
     // std.debug.print("get {any}\n", .{tree.root.cells[0]});
     // std.debug.print("get {any}\n", .{tree.root.header.right_page});
+
 }

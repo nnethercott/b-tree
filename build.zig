@@ -16,8 +16,18 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .optimize = b.standardOptimizeOption(.{}),
             .target = b.graph.host,
+            .link_libc = true,
         }),
     });
+
+    // NOTE: can't use the build.zig.zon dep since its on zig 0.15.1
+    // const droaring = b.dependency("roaring", .{});
+    // b_tree_exe.root_module.addImport("roaring", droaring.module("roaring.zig"));
+    b_tree_exe.root_module.addCSourceFile(.{
+        .file = b.path("roaring/roaring.c"),
+        .flags = &.{},
+    });
+    b_tree_exe.root_module.addIncludePath(b.path("roaring"));
 
     b.installArtifact(b_tree_exe);
 
@@ -29,7 +39,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "runs the unit tests");
 
     // imports are run twice ?
-    const test_files = [_][]const u8 { "src/tree.zig",};
+    const test_files = [_][]const u8{
+        "src/tree.zig",
+    };
 
     for (test_files) |file| {
         for (test_targets) |target| {
