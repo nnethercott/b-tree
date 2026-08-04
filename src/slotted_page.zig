@@ -2,18 +2,11 @@ const std = @import("std");
 const expect = std.testing.expect;
 
 // TODO:
-//
-// allocation
-// fba in a slice to page align ? std.heap.FixedBufferAllocator.init(buffer: []u8)
-// and then kept this allocator local to the slotted page ?
-// still doesn't guarantee we'll get "append from right" behaviour
-// BUT: could use a fba on the corresponding slice to alloc...
-
-// questions:
-// - [fanout]Cell is presumably allocated on the stack; how then do we get page alignment and why does that matter?
-//    - ^for me its related to mmapping some data structure ? so that the corresponding pages bring in a SlottedPage
-// - (zig question) defer "Executes an expression unconditionally at scope exit."
-//    => if we put this in a test helper we'd free the memory before running, no ?
+// Allocation
+// - replace raw pointers with page ids
+// - write a struct for managing a mmapped file and page id freelist (bitmap)
+// -> move the header bitmap code into a new helper ? or link libc for the practice :)
+//          https://ziggit.dev/t/rawr-roaring-bitmaps/14397
 
 pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type) type {
     // FIXME: comptime fn() comptime_int returning fanout from k, v as a default value
@@ -180,6 +173,9 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             /// indicates whether we need crumbs or not
             mode: Mode,
 
+            // FIXME: this gets replaced with a &PageManager
+            // which can actually be an interface like `Allocator` ? 
+            // -- this way we can use an in-memory testing allocator
             gpa: ?std.mem.Allocator = null,
 
             /// stores {ptr, split_idx} as a stack
