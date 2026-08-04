@@ -6,7 +6,7 @@ pub fn BTree(comptime fanout: usize, comptime k: type, comptime v: type) type {
         root: *Page,
     
         const Self = @This();
-        const Page = page.SlottedPage(fanout, k, v);
+        pub const Page = page.SlottedPage(fanout, k, v);
 
         pub fn init(gpa: std.mem.Allocator) !Self {
             const root = try gpa.create(Page);

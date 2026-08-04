@@ -1,13 +1,6 @@
 const std = @import("std");
 const expect = std.testing.expect;
 
-// TODO:
-// Allocation
-// - replace raw pointers with page ids
-// - write a struct for managing a mmapped file and page id freelist (bitmap)
-// -> move the header bitmap code into a new helper ? or link libc for the practice :)
-//          https://ziggit.dev/t/rawr-roaring-bitmaps/14397
-
 pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type) type {
     // FIXME: comptime fn() comptime_int returning fanout from k, v as a default value
     // FIXME: add signature like .init(gpa, &cmpKey) ?
