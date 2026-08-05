@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     // imports are run twice ?
     const test_files = [_][]const u8{
         "src/tree.zig",
+        "src/Store.zig",
     };
 
     for (test_files) |file| {
