@@ -23,11 +23,11 @@ pub fn build(b: *std.Build) void {
     // NOTE: can't use the build.zig.zon dep since its on zig 0.15.1
     // const droaring = b.dependency("roaring", .{});
     // b_tree_exe.root_module.addImport("roaring", droaring.module("roaring.zig"));
-    b_tree_exe.root_module.addCSourceFile(.{
-        .file = b.path("roaring/roaring.c"),
-        .flags = &.{},
-    });
-    b_tree_exe.root_module.addIncludePath(b.path("roaring"));
+    // b_tree_exe.root_module.addCSourceFile(.{
+    //     .file = b.path("roaring/roaring.c"),
+    //     .flags = &.{},
+    // });
+    // b_tree_exe.root_module.addIncludePath(b.path("roaring"));
 
     b.installArtifact(b_tree_exe);
 

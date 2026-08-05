@@ -1,5 +1,6 @@
 const std = @import("std");
 const expect = std.testing.expect;
+const Store = @import("Store.zig");
 
 pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type) type {
     // FIXME: comptime fn() comptime_int returning fanout from k, v as a default value

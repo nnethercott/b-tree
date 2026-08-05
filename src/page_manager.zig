@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const Store = @import("Store.zig");
 
 // TODO:(roaring)
 // - move the translate c step to build.zig
@@ -7,8 +8,8 @@ const Io = std.Io;
 // const roaring = @import("roaring.zig");
 
 pub const PageManager = struct {
-    map: Io.File.MemoryMap,
     io: std.Io,
+    map: Io.File.MemoryMap,
     offset: usize = 0,
     page_size: usize,
 
@@ -37,6 +38,10 @@ pub const PageManager = struct {
         };
     }
 
+    fn getPage(self: *const Self, page_id: usize) []u8 {
+        return self.map.memory[page_id * self.page_size .. (page_id + 1) * self.page_size];
+    }
+
     fn remap(self: *Self, len: usize) !void {
         const file = self.map.file;
         self.map.destroy(self.io);
@@ -44,18 +49,38 @@ pub const PageManager = struct {
         self.map = try file.createMemoryMap(self.io, .{ .len = len });
     }
 
-    fn getPage(self: *const Self, page_id: usize) []u8 {
-        return self.map.memory[page_id * self.page_size .. (page_id + 1) * self.page_size];
-    }
-
-    pub fn nextPage(self: *Self) ![]u8 {
+    // FIXME: we need to raise the interface error. 
+    // Let's look into how we can do this better !
+    fn alloc(self: *Self) !Store.KV {
+        // FIXME: should we err here or continue remapping ?
         if (self.offset * self.page_size >= self.map.memory.len) {
             try self.remap(2 * self.map.memory.len);
         }
-
-        const slice = self.getPage(self.offset);
+        const id = self.offset;
+        const kv: Store.KV = .{
+            .key = id,
+            .bytes = self.getPage(id),
+        };
         self.offset += 1;
 
-        return slice;
+        return kv;
+    }
+
+    fn fetch(self: *Self, id: usize) ?[]u8 {
+        if (id >= self.offset) {
+            return null;
+        }
+        return self.getPage(id);
+    }
+
+    // Returns a file-backed implementation of the `Store` interface
+    pub fn store(self: *Self) Store {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = Self.alloc,
+                .fetch = Self.fetch,
+            },
+        };
     }
 };

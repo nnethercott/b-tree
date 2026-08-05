@@ -4,18 +4,21 @@ const expect = std.testing.expect;
 const btree = @import("tree.zig");
 const page = @import("slotted_page.zig");
 const manager = @import("page_manager.zig");
-const r = @import("roaring.zig");
 
 const BTree = btree.BTree;
 
 pub fn main(init: std.process.Init) !void {
-    try bleh(init);
+    try foo(init);
+    // try bleh(init);
 }
 
 fn foo(init: std.process.Init) !void {
     var m: manager.PageManager = try .init("nate.db", init.io, std.heap.pageSize());
+    var store = m.store();
 
-    const buf = try m.nextPage();
+    const kv = try store.alloc();
+    const buf = kv.bytes;
+
     var fba: std.heap.FixedBufferAllocator = .init(buf);
     _ = try std.fmt.allocPrint(fba.allocator(), "hello, from nate", .{});
     try m.map.write(init.io);
