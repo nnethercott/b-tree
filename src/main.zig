@@ -4,12 +4,13 @@ const expect = std.testing.expect;
 const btree = @import("tree.zig");
 const page = @import("slotted_page.zig");
 const manager = @import("page_manager.zig");
+const hash_store = @import("Store.zig").hash_store;
 
 const BTree = btree.BTree;
 
 pub fn main(init: std.process.Init) !void {
-    try foo(init);
-    // try bleh(init);
+    // try foo(init);
+    try bleh(init);
 }
 
 fn foo(init: std.process.Init) !void {
@@ -33,8 +34,12 @@ fn bleh(init: std.process.Init) !void {
     const gpa = arena.allocator();
 
     const Tree = BTree(2, i32, i32);
+    var hs: hash_store(Tree.Page) = .init(gpa);
+    defer hs.deinit();
 
-    var tree: Tree = try .init(gpa);
+    // okok
+    var store = hs.store();
+    var tree: Tree = try .init(&store);
 
     try tree.insert(gpa, 0, 0);
     try tree.insert(gpa, 1, 1);
@@ -42,11 +47,16 @@ fn bleh(init: std.process.Init) !void {
     try tree.insert(gpa, 3, 3);
     try tree.insert(gpa, 4, 4);
 
+    var iter = hs.table.iterator();
+    while (iter.next()) |item| {
+        std.debug.print("{any}\n", .{item.key_ptr.*});
+    }
+
     // nice !
     // this makes zero copy kinda nice i guess
-    const slice: []u8 = @ptrCast(tree.root);
-    std.debug.print("{any}\n", .{slice});
+    // const slice: []u8 = @ptrCast(tree.root);
+    // std.debug.print("{any}\n", .{slice});
 
-    const node: *Tree.Page = @ptrCast(@alignCast(slice));
-    std.debug.print("{any}\n", .{node.cells[0].next_page.?.header.right_page.?});
+    // const node: *Tree.Page = @ptrCast(@alignCast(slice));
+    // std.debug.print("{any}\n", .{node.cells[0].next_page.?.header.right_page.?});
 }

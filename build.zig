@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .optimize = b.standardOptimizeOption(.{}),
             .target = b.graph.host,
-            .link_libc = true,
+            // .link_libc = true,
         }),
     });
 

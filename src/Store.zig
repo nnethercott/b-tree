@@ -26,7 +26,7 @@ pub fn fetch(s: *Store, id: usize) ?[]u8 {
 }
 
 // testing impl
-fn hash_store(T: type) type {
+pub fn hash_store(T: type) type {
     return struct {
         allocator: std.mem.Allocator,
         next_id: usize = 0,
@@ -34,11 +34,11 @@ fn hash_store(T: type) type {
 
         const Self = @This();
 
-        fn init(allocator: std.mem.Allocator) Self {
+        pub fn init(allocator: std.mem.Allocator) Self {
             return .{ .allocator = allocator, .table = .empty };
         }
 
-        fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self) void {
             var iter = self.table.iterator();
             while (iter.next()) |item| {
                 self.allocator.free(item.value_ptr.*);
@@ -62,7 +62,7 @@ fn hash_store(T: type) type {
             return self.table.get(id);
         }
 
-        fn store(self: *Self) Store {
+        pub fn store(self: *Self) Store {
             return .{
                 .ptr = self,
                 .vtable = &.{

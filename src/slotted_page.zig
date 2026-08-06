@@ -13,7 +13,6 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
         len: usize = 0,
 
         const Self = @This();
-        pub const empty: Self = .{ .header = .leaf };
 
         const MAGIC_OFFSET: comptime_int = capacity + 1;
 
@@ -31,7 +30,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             return self.cells[self.offsets[self.len - 1]];
         }
 
-        fn rightPage(self: *const Self) ?*Self {
+        fn rightPage(self: *const Self) ?usize {
             return self.header.right_page;
         }
 
@@ -50,6 +49,10 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             return self.cells[0..];
         }
 
+        fn id(self: *const Self) usize {
+            return self.header.id;
+        }
+
         /// Appends a cell unordered. Caller must ensure sorting of `offsets` afterwards
         fn pushAssumeCapacity(self: *Self, cell: Cell) void {
             const idx = self.nextFreeIdx() orelse self.len;
@@ -64,11 +67,11 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             // case capacity = 1
             const cell: Cell = .{
                 .key = right.firstCell().?.key,
-                .next_page = left,
+                .next_page = left.id(),
             };
 
             if (idx == MAGIC_OFFSET) {
-                self.header.right_page = right;
+                self.header.right_page = right.id();
 
                 self.offsets[self.len] = cell_idx;
                 self.cells[cell_idx] = cell;
@@ -83,7 +86,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             self.offsets[idx] = cell_idx;
             self.cells[cell_idx] = cell;
             // this cell already has the correct key, just change the page it points to
-            self.cells[self.offsets[idx + 1]].next_page = right;
+            self.cells[self.offsets[idx + 1]].next_page = right.id();
 
             self.len += 1;
         }
@@ -106,18 +109,16 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
                 Leaf,
             };
 
+            id: usize,
             kind: CellKind,
 
             // each cell stores a pointer to the page where keys are lte than it.
             // here we take the sqlite approach and keep the next ptr in the header
-            right_page: ?*Self = null,
+            right_page: ?usize = null,
 
             /// keeps track of available indexes in the page.cells array
             /// could make this a `comptime_int`
             freeblocks: u32 = 0,
-
-            const internal: Header = .{ .kind = .Internal };
-            const leaf: Header = .{ .kind = .Leaf };
 
             /// should be like [0,0,..1,1,..1] where @popCount(num) == fanout
             const FREEBLOCK_MASK: u32 = (1 << capacity) - 1;
@@ -148,7 +149,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             /// case: `CellKind.Internal`
             /// each separator key has a child pointer, while the last pointer is
             /// stored separately, since it’s not paired with any key
-            next_page: ?*Self = null,
+            next_page: ?usize = null,
         };
 
         const CmpHelpers = struct {
@@ -167,9 +168,6 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             /// indicates whether we need crumbs or not
             mode: Mode,
 
-            // FIXME: this gets replaced with a &PageManager
-            // which can actually be an interface like `Allocator` ? 
-            // -- this way we can use an in-memory testing allocator
             gpa: ?std.mem.Allocator = null,
 
             /// stores {ptr, split_idx} as a stack
@@ -208,7 +206,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             }
 
             /// Finds the next page at depth N+1 to search for a given needle
-            fn binarySearchPage(self: *Traversal, page: *Self, needle: k) !*Self {
+            fn binarySearchPage(self: *Traversal, page: *Self, needle: k) !usize {
                 const offsets = page.offsetsSlice();
                 const cells = page.cellsSlice();
 
@@ -219,7 +217,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
                     CmpHelpers.cmpKey,
                 );
 
-                const found, const idx = blk: {
+                const page_id, const idx = blk: {
                     if (offset_idx < page.len) {
                         const cell_idx = offsets[offset_idx];
                         break :blk .{ cells[cell_idx].next_page.?, offset_idx };
@@ -233,32 +231,36 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
                     .Search => {},
                 }
 
-                return found;
+                return page_id;
             }
         };
 
-        fn findLeaf(self: *Self, t: *Traversal, key: k) !*Self {
+        fn findLeaf(self: *Self, store: *Store, t: *Traversal, key: k) !*Self {
             const kind = self.header.kind;
 
             switch (kind) {
-                .Leaf => return self,
                 .Internal => {
-                    const next = try t.binarySearchPage(self, key);
-                    return next.findLeaf(t, key);
+                    const page_id = try t.binarySearchPage(self, key);
+                    // zero copy deser from bytes -> self
+                    const ptr = store.fetch(page_id).?;
+                    const page: *Self = @ptrCast(@alignCast(ptr));
+                    return page.findLeaf(store, t, key);
                 },
+                .Leaf => return self,
             }
         }
 
-        pub fn insert(self: *Self, gpa: std.mem.Allocator, key: k, value: v) !*Self {
+        // FIXME: should get rid of gpa here, it's only needed in the Traversal
+        pub fn insert(self: *Self, gpa: std.mem.Allocator, store: *Store, key: k, value: v) !*Self {
             var root = self;
 
             var t: Traversal = .{ .mode = .Insert, .gpa = gpa };
             defer t.clearAndFree();
 
-            var leaf = try self.findLeaf(&t, key);
+            var leaf = try self.findLeaf(store, &t, key);
 
             if (leaf.full()) {
-                const items = try leaf.splitCascade(gpa, &t);
+                const items = try leaf.splitCascade(store, &t);
                 const right = items.new_page;
 
                 if (right.firstCell().?.key > key) {
@@ -285,13 +287,20 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             return root;
         }
 
-        fn split(self: *Self, gpa: std.mem.Allocator) !struct { *Self, *Self } {
+        fn split(self: *Self, store: *Store) !struct { *Self, *Self } {
             if (!self.full()) return error.NoNeedToSplit;
 
-            const kind = self.header.kind;
-            const right = try gpa.create(Self);
+            const entry = try store.alloc();
+            const page_id = entry.key;
+            // FIXME: we may need to check entry.bytes.len = @sizeOf(Self)
+            const right: *Self = @ptrCast(@alignCast(entry.bytes));
 
-            right.* = .{ .header = .{ .kind = kind } };
+            const kind = self.header.kind;
+
+            right.* = .{ .header = .{
+                .kind = kind,
+                .id = page_id,
+            } };
 
             // hacky @divCeil in zig 0.16
             const half: comptime_int = @divFloor(capacity, 2) + (capacity % 2);
@@ -318,26 +327,28 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
         }
 
         // FIXME: write tests for this when parents.full()
-        fn splitCascade(self: *Self, gpa: std.mem.Allocator, t: *Traversal) !struct { root: *Self, new_page: *Self } {
+        fn splitCascade(self: *Self, store: *Store, t: *Traversal) !struct { root: *Self, new_page: *Self } {
             var root = self;
 
-            const left, const right = try self.split(gpa);
+            const left, const right = try self.split(store);
             const crumb = t.breadcrumbs.pop();
 
             if (crumb == null) {
                 // create a new SlottedPage with siblings
-                root = try gpa.create(Self);
+                const entry = try store.alloc();
+                root = @ptrCast(@alignCast(entry.bytes));
                 root.* = .{
                     .header = .{
+                        .id = entry.key,
                         .kind = .Internal,
-                        .right_page = right,
+                        .right_page = right.id(),
                     },
                     .len = 1,
                 };
                 root.offsets[0] = 0;
                 root.cells[0] = .{
                     .key = right.firstCell().?.key,
-                    .next_page = left,
+                    .next_page = left.id(),
                 };
 
                 return .{ .root = root, .new_page = right };
@@ -350,7 +361,7 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
                 parent.insertSiblings(idx, left, right);
                 root = parent;
             } else {
-                const items = try parent.splitCascade(gpa, t);
+                const items = try parent.splitCascade(store, t);
 
                 if (idx < parent.len) {
                     parent.insertSiblings(idx, left, right);
@@ -363,14 +374,12 @@ pub fn SlottedPage(comptime capacity: usize, comptime k: type, comptime v: type)
             return .{ .root = root, .new_page = right };
         }
 
-        pub fn get(self: *const Self, key: k) ?v {
+        pub fn get(self: *const Self, store: *Store, key: k) ?v {
             var t: Traversal = .{ .mode = .Search };
 
             // SAFETY: no allocations are done in search mode
             const self_mut: *Self = @constCast(self);
-            const leaf = findLeaf(self_mut, &t, key) catch unreachable;
-
-            std.debug.print("{any}\n", .{leaf});
+            const leaf = findLeaf(self_mut, store, &t, key) catch unreachable;
 
             const cell = t.binarySearchCell(leaf, key) orelse return null;
             return cell.value.?;
